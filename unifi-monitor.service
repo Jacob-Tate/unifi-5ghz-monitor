@@ -1,0 +1,14 @@
+[Unit]
+Description=UniFi 5GHz Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=unifi_user
+WorkingDirectory=/home/unifi_user
+ExecStart=/usr/bin/python3 /home/unifi_user/monitor.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

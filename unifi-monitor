@@ -1,0 +1,15 @@
+/var/log/unifi_monitor.log {
+    size 100M
+    rotate 7
+    notifempty
+    compress    
+    create 644 unifi_user unifi_user
+    dateext
+    dateformat -%Y%m%d-%H%M%S
+    missingok
+    copytruncate
+ 
+    postrotate
+        echo "$(date): UniFi monitor log rotated" >> /var/log/unifi_monitor_maintenance.log
+    endscript
+}
