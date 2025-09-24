@@ -32,7 +32,7 @@ def trace(self, message, *args, **kwargs):
 logging.Logger.trace = trace
 
 class UniFiController:
-    def __init__(self, host: str, username: str, password: str, port: int = 443, verify_ssl: bool = False, verbose: bool = False, trace: bool = False):
+    def __init__(self, host: str, username: str, password: str, port: int = 443, verify_ssl: bool = False, verbose: bool = False, trace: bool = False, client_threshold: int = 10):
         self.host = host
         self.port = port
         self.username = username
@@ -43,6 +43,7 @@ class UniFiController:
         self.session.verify = verify_ssl
         self.verbose = verbose
         self.trace = trace
+        self.client_threshold = client_threshold
         
         # Webhook configuration
         self.webhook_url = os.getenv('WEBHOOK_URL')
@@ -76,6 +77,9 @@ class UniFiController:
             force=True  # Force reconfiguration
         )
         self.logger = logging.getLogger(__name__)
+        
+        if self.verbose:
+            self.logger.info(f"Client threshold set to: {self.client_threshold} (APs with fewer clients will not trigger alerts)")
     
     def send_webhook_notification(self, title: str, message: str, priority: str = "normal") -> bool:
         """Send webhook notification with support for multiple platforms"""
@@ -384,7 +388,7 @@ class UniFiController:
         return None
     
     def analyze_ap_bands(self, site_name: str = "default") -> List[Dict]:
-        """Analyze APs for 5GHz band issues with verbose details"""
+        """Analyze APs for 5GHz band issues with verbose details and client threshold filtering"""
         aps = self.get_access_points(site_name)
         clients = self.get_clients(site_name)
         
@@ -392,6 +396,7 @@ class UniFiController:
             self.logger.info(f"Found {len(aps)} access points and {len(clients)} clients")
         
         problematic_aps = []
+        skipped_low_count = []
         
         for ap in aps:
             ap_mac = ap.get('mac', '')
@@ -475,6 +480,8 @@ class UniFiController:
                 elif self.verbose:
                     self.logger.debug(f"    Could not determine band for client {hostname} - Radio: {radio}, Channel: {channel}")
             
+            total_clients = sum(band_counts.values())
+            
             if self.verbose:
                 self.logger.debug("CLIENT DISTRIBUTION:")
                 for band in ['2g', '5g', '6g']:
@@ -483,11 +490,32 @@ class UniFiController:
                         for client in client_details[band]:
                             self.logger.debug(f"    - {client['hostname']} (RSSI: {client['rssi']}dBm, "
                                             f"CH: {client['channel']}, Up: {client['uptime']//60}m)")
+                self.logger.debug(f"  TOTAL: {total_clients} clients")
             
             # Check for the specific issue: 0 clients on 5GHz but clients on other bands
             has_5g_issue = (band_counts['5g'] == 0 and (band_counts['2g'] > 0 or band_counts['6g'] > 0))
             
-            if has_5g_issue or self.verbose:
+            # Apply client threshold: only flag as problematic if total clients >= threshold
+            meets_threshold = total_clients >= self.client_threshold
+            
+            if has_5g_issue and not meets_threshold:
+                # This AP has a 5GHz issue but doesn't meet the client threshold
+                skipped_low_count.append({
+                    'ap_name': ap_name,
+                    'total_clients': total_clients,
+                    'threshold': self.client_threshold,
+                    'clients_2g': band_counts['2g'],
+                    'clients_5g': band_counts['5g'],
+                    'clients_6g': band_counts['6g']
+                })
+                
+                if self.verbose:
+                    self.logger.debug(f"SKIPPED - AP {ap_name} has potential 5GHz issue but only {total_clients} clients "
+                                    f"(threshold: {self.client_threshold})")
+                
+                has_5g_issue = False  # Don't flag as problematic
+            
+            if (has_5g_issue and meets_threshold) or self.verbose:
                 issue_data = {
                     'ap_name': ap_name,
                     'ap_mac': ap_mac,
@@ -496,22 +524,24 @@ class UniFiController:
                     'clients_2g': band_counts['2g'],
                     'clients_5g': band_counts['5g'],
                     'clients_6g': band_counts['6g'],
-                    'total_clients': sum(band_counts.values()),
+                    'total_clients': total_clients,
+                    'meets_threshold': meets_threshold,
                     'timestamp': datetime.now().isoformat(),
                     'uptime': ap_uptime,
                     'radio_details': radio_details,
                     'client_details': client_details,
-                    'has_issue': has_5g_issue
+                    'has_issue': has_5g_issue and meets_threshold
                 }
                 
-                if has_5g_issue:
+                if has_5g_issue and meets_threshold:
                     problematic_aps.append(issue_data)
                     
                     self.logger.warning(
                         f"5GHz ISSUE DETECTED - AP: {ap_name} ({ap_model}) - "
                         f"2.4GHz: {band_counts['2g']} clients, "
                         f"5GHz: {band_counts['5g']} clients, "
-                        f"6GHz: {band_counts['6g']} clients"
+                        f"6GHz: {band_counts['6g']} clients "
+                        f"(Total: {total_clients}, Threshold: {self.client_threshold})"
                     )
                     
                     if self.verbose:
@@ -525,7 +555,15 @@ class UniFiController:
                             self.logger.error("  ❌ 5GHz radio appears to be DISABLED")
                 
                 elif self.verbose:
-                    self.logger.info(f"✅ AP {ap_name} - No 5GHz issues detected")
+                    self.logger.info(f"✅ AP {ap_name} - No 5GHz issues detected (Total clients: {total_clients})")
+        
+        # Log summary of skipped APs
+        if skipped_low_count:
+            self.logger.info(f"📊 Skipped {len(skipped_low_count)} APs due to low client count (< {self.client_threshold})")
+            if self.verbose:
+                for skipped in skipped_low_count:
+                    self.logger.debug(f"  - {skipped['ap_name']}: {skipped['total_clients']} clients "
+                                    f"(2G:{skipped['clients_2g']}, 5G:{skipped['clients_5g']}, 6G:{skipped['clients_6g']})")
         
         return problematic_aps
     
@@ -563,7 +601,8 @@ def print_detailed_ap_info(ap_info: Dict, verbose: bool = False):
     
     print(f"Clients - 2.4GHz: {ap_info['clients_2g']}, "
           f"5GHz: {ap_info['clients_5g']}, "
-          f"6GHz: {ap_info['clients_6g']}")
+          f"6GHz: {ap_info['clients_6g']} "
+          f"(Total: {ap_info['total_clients']})")
     
     if verbose and 'radio_details' in ap_info:
         print("\nRadio Status:")
@@ -605,6 +644,7 @@ def main():
     VERBOSE_MODE = os.getenv('VERBOSE_MODE', 'true').lower() == 'true'
     TRACE_MODE = os.getenv('TRACE_MODE', 'false').lower() == 'true'  # New trace mode
     WEBHOOK_ENABLED = os.getenv('WEBHOOK_ENABLED', 'false').lower() == 'true'
+    CLIENT_THRESHOLD = int(os.getenv('CLIENT_THRESHOLD', '10'))  # New client threshold
     
     print("UniFi 5GHz Band Monitor Starting...")
     print(f"Controller: {CONTROLLER_HOST}:{PORT}")
@@ -614,10 +654,14 @@ def main():
     print(f"Verbose Mode: {VERBOSE_MODE}")
     print(f"Trace Mode: {TRACE_MODE}")
     print(f"Webhook Notifications: {WEBHOOK_ENABLED}")
+    print(f"Client Threshold: {CLIENT_THRESHOLD} (APs with fewer clients will not trigger alerts)")
     print(f"Log File: {os.getenv('LOG_FILE', 'unifi_5ghz_monitor.log')}")
     print("-" * 50)
     
-    controller = UniFiController(CONTROLLER_HOST, USERNAME, PASSWORD, PORT, verbose=VERBOSE_MODE, trace=TRACE_MODE)
+    controller = UniFiController(
+        CONTROLLER_HOST, USERNAME, PASSWORD, PORT, 
+        verbose=VERBOSE_MODE, trace=TRACE_MODE, client_threshold=CLIENT_THRESHOLD
+    )
     
     if not controller.login():
         print("Failed to login to UniFi Controller. Exiting.")
@@ -633,7 +677,7 @@ def main():
     if WEBHOOK_ENABLED:
         controller.send_webhook_notification(
             "UniFi Monitor - Started",
-            f"5GHz band monitoring started for {CONTROLLER_HOST}\nCheck interval: {CHECK_INTERVAL}s\nLogging: {'TRACE' if TRACE_MODE else 'DEBUG' if VERBOSE_MODE else 'INFO'}",
+            f"5GHz band monitoring started for {CONTROLLER_HOST}\nCheck interval: {CHECK_INTERVAL}s\nClient threshold: {CLIENT_THRESHOLD}\nLogging: {'TRACE' if TRACE_MODE else 'DEBUG' if VERBOSE_MODE else 'INFO'}",
             "normal"
         )
     
@@ -643,7 +687,7 @@ def main():
         while True:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             mode_str = 'TRACE ' if TRACE_MODE else 'VERBOSE ' if VERBOSE_MODE else ''
-            print(f"\n[{timestamp}] Running {mode_str}5GHz band check...")
+            print(f"\n[{timestamp}] Running {mode_str}5GHz band check (threshold: {CLIENT_THRESHOLD} clients)...")
             
             if VERBOSE_MODE or TRACE_MODE:
                 print("🔍 Gathering detailed AP and client information...")
@@ -651,7 +695,7 @@ def main():
             problematic_aps = controller.analyze_ap_bands(SITE_NAME)
             
             if problematic_aps:
-                print(f"\n⚠️  FOUND {len(problematic_aps)} APs WITH 5GHz ISSUES:")
+                print(f"\n⚠️  FOUND {len(problematic_aps)} APs WITH 5GHz ISSUES (above threshold):")
                 print("=" * 80)
                 
                 # Prepare webhook message
@@ -673,6 +717,7 @@ def main():
                         f"2.4GHz: {ap_info['clients_2g']} clients, "
                         f"5GHz: {ap_info['clients_5g']} clients, "
                         f"6GHz: {ap_info['clients_6g']} clients\n"
+                        f"Total: {ap_info['total_clients']} (threshold: {CLIENT_THRESHOLD})\n"
                         f"Consecutive issues: {consecutive_issues[ap_mac]}"
                     )
                     
@@ -700,7 +745,7 @@ def main():
                             if WEBHOOK_ENABLED:
                                 controller.send_webhook_notification(
                                     "UniFi AP Auto-Restarted",
-                                    f"AP {ap_info['ap_name']} ({ap_info['ap_model']}) has been automatically restarted due to persistent 5GHz issues.\n\nLocation: {CONTROLLER_HOST}\nReason: 5GHz band had 0 clients while other bands were active",
+                                    f"AP {ap_info['ap_name']} ({ap_info['ap_model']}) has been automatically restarted due to persistent 5GHz issues.\n\nLocation: {CONTROLLER_HOST}\nTotal clients: {ap_info['total_clients']}\nReason: 5GHz band had 0 clients while other bands were active",
                                     "high"
                                 )
                     
@@ -713,9 +758,10 @@ def main():
                     
                     if new_issues:
                         title = f"UniFi 5GHz Issues Detected ({len(new_issues)} new)"
-                        message = f"New 5GHz band issues detected on {CONTROLLER_HOST}:\n\n" + "\n\n".join([
+                        message = f"New 5GHz band issues detected on {CONTROLLER_HOST} (client threshold: {CLIENT_THRESHOLD}):\n\n" + "\n\n".join([
                             f"• {ap['ap_name']} ({ap['ap_model']}): "
-                            f"2.4GHz: {ap['clients_2g']}, 5GHz: {ap['clients_5g']}, 6GHz: {ap['clients_6g']}"
+                            f"2.4GHz: {ap['clients_2g']}, 5GHz: {ap['clients_5g']}, 6GHz: {ap['clients_6g']} "
+                            f"(Total: {ap['total_clients']})"
                             for ap in new_issues
                         ])
                         controller.send_webhook_notification(title, message, "high")
@@ -723,18 +769,20 @@ def main():
                     elif persistent_issues:
                         title = f"UniFi Persistent 5GHz Issues ({len(persistent_issues)} APs)"
                         message = f"Persistent 5GHz issues on {CONTROLLER_HOST}:\n\n" + "\n\n".join([
-                            f"• {ap['ap_name']}: {consecutive_issues[ap['ap_mac']]} consecutive checks"
+                            f"• {ap['ap_name']}: {consecutive_issues[ap['ap_mac']]} consecutive checks "
+                            f"({ap['total_clients']} total clients)"
                             for ap in persistent_issues
                         ])
                         controller.send_webhook_notification(title, message, "normal")
                 
             else:
-                print("✅ No 5GHz band issues detected")
+                print("✅ No 5GHz band issues detected (above threshold)")
                 if VERBOSE_MODE or TRACE_MODE:
                     # Get all APs for summary even when no issues
                     all_aps = controller.get_access_points(SITE_NAME)
                     online_aps = [ap for ap in all_aps if ap.get('state') == 1]
                     print(f"📊 Summary: {len(online_aps)} APs online, all 5GHz bands functioning normally")
+                    print(f"   (Client threshold: {CLIENT_THRESHOLD} - APs with fewer clients are ignored)")
                 
                 # Send resolution notification if we had issues before
                 if consecutive_issues and WEBHOOK_ENABLED:
@@ -749,6 +797,7 @@ def main():
             print(f"\n⏰ Next check in {CHECK_INTERVAL} seconds...")
             if not VERBOSE_MODE and not TRACE_MODE:
                 print("   💡 Tip: Set VERBOSE_MODE=true or TRACE_MODE=true in .env for detailed diagnostics")
+                print(f"   📊 Current client threshold: {CLIENT_THRESHOLD} (set CLIENT_THRESHOLD in .env to change)")
             elif VERBOSE_MODE and not TRACE_MODE:
                 print("   🔍 Tip: Set TRACE_MODE=true in .env for ultra-detailed API debugging")
             
