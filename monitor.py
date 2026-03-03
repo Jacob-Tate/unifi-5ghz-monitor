@@ -48,6 +48,8 @@ class UniFiController:
         self.trace = trace
         self.client_threshold = client_threshold
         
+        self._auth_failures = 0
+
         # Webhook configuration
         self.webhook_url = os.getenv('WEBHOOK_URL')
         self.webhook_type = os.getenv('WEBHOOK_TYPE', 'generic').lower()
@@ -242,40 +244,54 @@ class UniFiController:
             self.logger.error(f"Login error: {e}")
             return False
     
+    def _api_get(self, path: str) -> Optional[requests.Response]:
+        """Make a GET request, re-authenticating once on 401."""
+        url = f"{self.base_url}{self.network_prefix}{path}"
+        try:
+            response = self.session.get(url)
+            if response.status_code == 401:
+                self.logger.warning("Session expired (401), re-authenticating...")
+                if self.login():
+                    self._auth_failures = 0
+                    response = self.session.get(f"{self.base_url}{self.network_prefix}{path}")
+                else:
+                    self._auth_failures += 1
+                    self.logger.error(f"Re-authentication failed (attempt {self._auth_failures})")
+                    if self._auth_failures >= 3:
+                        self.send_webhook_notification(
+                            "UniFi Monitor Auth Failure",
+                            f"Failed to re-authenticate to {self.host} {self._auth_failures} times in a row. Monitor may be down.",
+                            priority="high"
+                        )
+                    return None
+            else:
+                self._auth_failures = 0
+            return response
+        except Exception as e:
+            self.logger.error(f"Request error for {path}: {e}")
+            return None
+
     def get_sites(self) -> List[Dict]:
         """Get all sites"""
-        try:
-            response = self.session.get(f"{self.base_url}{self.network_prefix}/api/self/sites")
-            if response.status_code == 200:
-                return response.json()['data']
-            return []
-        except Exception as e:
-            self.logger.error(f"Error getting sites: {e}")
-            return []
-    
+        response = self._api_get("/api/self/sites")
+        if response and response.status_code == 200:
+            return response.json()['data']
+        return []
+
     def get_access_points(self, site_name: str = "default") -> List[Dict]:
         """Get all access points for a site"""
-        try:
-            response = self.session.get(f"{self.base_url}{self.network_prefix}/api/s/{site_name}/stat/device")
-            if response.status_code == 200:
-                devices = response.json()['data']
-                # Filter for access points only
-                return [device for device in devices if device.get('type') == 'uap']
-            return []
-        except Exception as e:
-            self.logger.error(f"Error getting access points: {e}")
-            return []
-    
+        response = self._api_get(f"/api/s/{site_name}/stat/device")
+        if response and response.status_code == 200:
+            devices = response.json()['data']
+            return [device for device in devices if device.get('type') == 'uap']
+        return []
+
     def get_clients(self, site_name: str = "default") -> List[Dict]:
         """Get all connected clients for a site"""
-        try:
-            response = self.session.get(f"{self.base_url}{self.network_prefix}/api/s/{site_name}/stat/sta")
-            if response.status_code == 200:
-                return response.json()['data']
-            return []
-        except Exception as e:
-            self.logger.error(f"Error getting clients: {e}")
-            return []
+        response = self._api_get(f"/api/s/{site_name}/stat/sta")
+        if response and response.status_code == 200:
+            return response.json()['data']
+        return []
     
     def get_radio_details(self, ap: Dict) -> Dict:
         """Extract detailed radio information from AP"""
@@ -550,14 +566,30 @@ def main():
                     ap_mac = ap_info['ap_mac']
                     previous_count = consecutive_issues.get(ap_mac, 0)
                     consecutive_issues[ap_mac] = previous_count + 1
-                    
+
                     print(f"\nISSUE #{i}:")
                     print_detailed_ap_info(ap_info, VERBOSE_MODE)
                     print(f"🔄 Consecutive issues: {consecutive_issues[ap_mac]}")
-                    
+
+                    if consecutive_issues[ap_mac] == 1 and WEBHOOK_ENABLED:
+                        controller.send_webhook_notification(
+                            "UniFi 5GHz Issue Detected",
+                            f"AP {ap_info['ap_name']} ({ap_info['ap_model']}) has 0 clients on 5GHz "
+                            f"but {ap_info['clients_2g']} on 2.4GHz / {ap_info['clients_6g']} on 6GHz "
+                            f"(Total: {ap_info['total_clients']})",
+                            priority="normal"
+                        )
+
                     if AUTO_RESTART and consecutive_issues[ap_mac] >= 3:
                         print(f"\n🔄 Auto-restarting AP {ap_info['ap_name']} after 3 consecutive issues...")
                         if controller.restart_ap_radios(ap_mac, SITE_NAME):
+                            if WEBHOOK_ENABLED:
+                                controller.send_webhook_notification(
+                                    "UniFi AP Restarted",
+                                    f"AP {ap_info['ap_name']} ({ap_info['ap_model']}) was auto-restarted after "
+                                    f"{consecutive_issues[ap_mac]} consecutive 5GHz issues.",
+                                    priority="high"
+                                )
                             consecutive_issues[ap_mac] = 0
             else:
                 print("✅ No 5GHz band issues detected (above threshold)")
