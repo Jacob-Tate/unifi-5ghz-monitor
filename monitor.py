@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 """
 UniFi 5GHz Band Monitor
 Detects APs with 0 clients on 5GHz but clients on 2.4GHz/6GHz bands
@@ -248,12 +250,12 @@ class UniFiController:
         """Make a GET request, re-authenticating once on 401."""
         url = f"{self.base_url}{self.network_prefix}{path}"
         try:
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=30)
             if response.status_code == 401:
                 self.logger.warning("Session expired (401), re-authenticating...")
                 if self.login():
                     self._auth_failures = 0
-                    response = self.session.get(f"{self.base_url}{self.network_prefix}{path}")
+                    response = self.session.get(f"{self.base_url}{self.network_prefix}{path}", timeout=30)
                 else:
                     self._auth_failures += 1
                     self.logger.error(f"Re-authentication failed (attempt {self._auth_failures})")
